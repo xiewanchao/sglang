@@ -9,7 +9,7 @@ import torch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 try:
     from ucm.integration.sglang.uc_connector import UnifiedCacheConnector, UnifiedCacheConfig, EnvironmentConfig
@@ -23,6 +23,25 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class LayerLoadTransferCounter:
+
+    def __init__(
+        self,
+        num_layers: int,
+        load_stream: torch.cuda.Stream,
+        uc_connector: UnifiedCacheConnector,
+        printable: bool = False,
+    ):
+        self.num_layers = num_layers
+        self.load_stream = load_stream
+        self.uc_connector = uc_connector
+
+    def wait_until(self, layer_id: int):
+        # Ensure ordering of the async loads wrt compute stream(s).
+        self.load_stream.synchronize()
+        with self.load_stream:
+            self.uc_connector.wait_for_layer_load(layer_id)
 
 
 class UCRadixCache(RadixCache):
@@ -90,10 +109,82 @@ class UCRadixCache(RadixCache):
             environmentConfig=env_config,
         )
 
+        self.load_stream = torch.cuda.Stream()
+        self.store_stream = torch.cuda.Stream()
 
+        self.layer_done_executor = LayerLoadTransferCounter(
+            num_layers=(
+                model_config.num_hidden_layers if model_config is not None else 0
+            ),
+            load_stream=self.load_stream,
+            uc_connector=self.uc_connector,
+        )
+        kvcache.register_layer_transfer_counter(self.layer_done_executor)
 
     def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:  # type: ignore[override]
-        pass
+        if self.disable or not key:
+            return super().match_prefix(key, **kwargs)
+        
+        if self.page_size != 1:
+            aligned_len = len(key) // self.page_size * self.page_size
+            key = key[:aligned_len]
+        
+        base_res = super().match_prefix(key, **kwargs)
+        value: torch.Tensor = base_res.device_indices
+        last_node: TreeNode = base_res.last_device_node
+
+        if value.numel() == len(key):
+            return base_res
+        
+        uncached_len = len(key) - value.numel()
+        if uncached_len == 0:
+            return base_res
+        
+        # ucm look up
+        rid = kwargs.get("req_id", None)
+        num_lookup_hits = self.uc_connector.get_num_new_matched_tokens(
+            request_id = rid,
+            token_ids = key.token_ids,
+            num_computed_tokens = value.numel() 
+        )
+
+        if num_lookup_hits == 0:
+            return base_res
+
+        if self.token_to_kv_pool_allocator.available_size() < num_lookup_hits:
+            self.evict(num_lookup_hits)
+        
+        token_slots = self.token_to_kv_pool_allocator.alloc(num_lookup_hits)
+        if token_slots is None:
+            return base_res
+
+        with torch.cuda.stream(self.load_stream):
+            self.uc_connector.start_load_kv(
+                token_slots=token_slots,
+                request_id=rid,
+            )
+
+        new_node = TreeNode()
+        start = value.numel()
+        end = start + num_lookup_hits
+        new_node.key = key[start:end]
+        new_node.value = token_slots
+        new_node.parent = last_node
+        last_node.children[self.get_child_key_fn(new_node.key)] = new_node
+        last_node = new_node
+
+        # HBM + storage hit indices
+        value = torch.cat([value, token_slots])
+        self.evictable_size_ += num_lookup_hits
+
+        self._record_store_event(new_node.parent)
+        self._record_store_event(new_node)
+
+        return MatchResult(
+            device_indices=value,
+            last_device_node=last_node,
+            last_host_node=last_node,
+        )
 
     def _parse_kv_transfer_config(self, kv_transfer_config: Optional[str]) -> dict:
         if kv_transfer_config:
