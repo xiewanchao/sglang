@@ -746,6 +746,7 @@ class Scheduler(
                     model_name=server_args.served_model_name,
                     storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
                     is_eagle=self.spec_algorithm.is_eagle(),
+                    enable_trace=self.server_args.enable_trace,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -987,7 +988,12 @@ class Scheduler(
 
             batch_result = None
             if batch:
+                if batch.forward_mode.is_extend():
+                    trace_slice_batch("pre process", batch.reqs)
                 batch_result = self.run_batch(batch)
+                if batch.forward_mode.is_extend():
+                    trace_slice_batch("run batch", batch.reqs)
+                
                 self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
@@ -1395,6 +1401,8 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache)
+            trace_slice_end("match prefix", req.rid, auto_next_anon=True)
+
             if req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped
                 # otherwise, the allocated GPU memory must be locked for integrity
@@ -1417,14 +1425,16 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
+            trace_slice_end("generate request", req.rid, auto_next_anon=True)
+
             if not self._set_or_validate_priority(req):
                 return
             if self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
+            trace_slice_end("start prefetch", req.rid, auto_next_anon=True)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
-            trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -1845,6 +1855,7 @@ class Scheduler(
             if req.time_stats.forward_entry_time == 0:
                 # Avoid update chunked request many times
                 req.time_stats.forward_entry_time = time.perf_counter()
+                trace_slice_end("schedule to running", req.rid, auto_next_anon=True)
                 if self.enable_metrics:
                     self.metrics_collector.observe_queue_time(
                         req.time_stats.get_queueing_time(),
@@ -2088,6 +2099,7 @@ class Scheduler(
     ):
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
+            # open & close decode trace
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
 
         elif batch.forward_mode.is_extend():

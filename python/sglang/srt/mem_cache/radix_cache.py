@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.tracing.trace import trace_get_proc_propagate_context
+
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +25,7 @@ import heapq
 import time
 from collections import defaultdict
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -50,11 +52,20 @@ if TYPE_CHECKING:
 
 class RadixKey:
 
-    def __init__(self, token_ids: List[int], extra_key: Optional[str] = None):
+    def __init__(
+        self, 
+        token_ids: List[int], 
+        extra_key: Optional[str] = None, 
+        request_id: str = None, 
+        trace_context: Optional[Dict[str, Any]] = None, 
+    ):
         # token ids sequence
         self.token_ids = token_ids
         # extra key (e.g. lora_id, cache_salt)
         self.extra_key = extra_key
+        self.request_id = request_id
+        self.trace_context = trace_context
+
 
     def __len__(self) -> int:
         return len(self.token_ids)
@@ -64,8 +75,8 @@ class RadixKey:
 
     def __getitem__(self, idx: Union[int, slice]) -> "RadixKey":
         if isinstance(idx, slice):
-            return RadixKey(self.token_ids[idx], self.extra_key)
-        return RadixKey([self.token_ids[idx]], self.extra_key)
+            return RadixKey(self.token_ids[idx], self.extra_key, self.request_id, self.trace_context)
+        return RadixKey([self.token_ids[idx]], self.extra_key, self.request_id, self.trace_context)
 
     def __repr__(self) -> str:
         preview = self.token_ids[:10]
@@ -84,6 +95,8 @@ class TreeNode:
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
+        self.request_id: str = None, 
+        self.trace_context: Optional[Dict[str, Any]] = None, 
 
         self.hit_count = 0
         # indicating the node is locked to protect from eviction
@@ -93,7 +106,7 @@ class TreeNode:
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
-
+        
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -372,11 +385,11 @@ class RadixCache(BasePrefixCache):
             # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
             # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
-
+        trace_context = trace_get_proc_propagate_context(req.rid)
         # Radix Cache takes one ref in memory pool
         if is_insert:
             new_prefix_len = self.insert(
-                RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
+                RadixKey(token_ids[:page_aligned_token_len], req.extra_key, req.rid, trace_context),
                 page_aligned_kv_indices,
             )
             # Free the duplicates that were already in the tree
@@ -429,10 +442,11 @@ class RadixCache(BasePrefixCache):
             # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
             # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
+        trace_context = trace_get_proc_propagate_context(req.rid)
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
-            RadixKey(page_aligned_token_ids, req.extra_key),
+            RadixKey(page_aligned_token_ids, req.extra_key, req.rid, trace_context),
             page_aligned_kv_indices,
             chunked=chunked,
         )
@@ -440,7 +454,7 @@ class RadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(
-            RadixKey(token_ids=page_aligned_token_ids, extra_key=req.extra_key)
+            RadixKey(token_ids=page_aligned_token_ids, extra_key=req.extra_key, request_id=req.rid, trace_context=trace_context)
         )
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
@@ -594,6 +608,8 @@ class RadixCache(BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len]
+        new_node.request_id = key.request_id
+        new_node.trace_context = key.trace_context
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:]
@@ -632,6 +648,8 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value
+            new_node.request_id = key.request_id
+            new_node.trace_context = key.trace_context
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._record_store_event(new_node)

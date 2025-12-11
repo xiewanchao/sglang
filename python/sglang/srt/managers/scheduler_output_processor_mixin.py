@@ -168,7 +168,7 @@ class SchedulerOutputProcessorMixin:
                         req.grammar.finished = req.finished()
 
                     trace_slice(
-                        RequestStage.PREFILL_FORWARD,
+                        "post process",
                         req.rid,
                         auto_next_anon=not req.finished(),
                         thread_finish_flag=req.finished(),
@@ -203,7 +203,7 @@ class SchedulerOutputProcessorMixin:
                             logprob_pt += num_input_logprobs
 
                     trace_slice(
-                        RequestStage.PREFILL_CHUNKED_FORWARD,
+                        "post chunked process",
                         req.rid,
                         auto_next_anon=True,
                     )

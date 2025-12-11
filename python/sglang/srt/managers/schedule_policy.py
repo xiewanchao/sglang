@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.tracing.trace import trace_get_proc_propagate_context
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -179,9 +181,11 @@ class SchedulePolicy:
             extra_key = r.extra_key
 
             # NOTE: the prefix_indices must always be aligned with last_node
+            trace_context = trace_get_proc_propagate_context(r.rid)
+
             r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
                 self.tree_cache.match_prefix(
-                    rid=r.rid, key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                    rid=r.rid, key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, request_id=r.rid, trace_context=trace_context)
                 )
             )
 
@@ -196,7 +200,7 @@ class SchedulePolicy:
                 in_batch_matching_prefixes, _, _, _ = (
                     self.waiting_queue_radix_tree.match_prefix(
                         rid=r.rid,
-                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, request_id=r.rid, trace_context=trace_context),
                     )
                 )
                 if (
@@ -207,7 +211,7 @@ class SchedulePolicy:
                 else:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
-                        RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                        RadixKey(token_ids=prefix_ids, extra_key=extra_key, request_id=r.rid, trace_context=trace_context),
                         torch.empty(len(prefix_ids), dtype=torch.bool),
                     )
         return temporary_deprioritized

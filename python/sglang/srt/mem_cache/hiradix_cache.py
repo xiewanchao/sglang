@@ -7,6 +7,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.tracing.trace import trace_get_proc_propagate_context
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
@@ -45,6 +46,7 @@ class HiRadixCache(RadixCache):
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
         is_eagle: bool = False,
+        enable_trace: bool = False,
     ):
 
         if hicache_io_backend == "direct":
@@ -109,6 +111,7 @@ class HiRadixCache(RadixCache):
             prefetch_threshold=self.prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=extra_config,
+            enable_trace=enable_trace,
         )
         if self.enable_storage_metrics:
             # TODO: support pp
@@ -258,7 +261,7 @@ class HiRadixCache(RadixCache):
         )
 
         operation_id = self.cache_controller.write_storage(
-            node.host_value, node.key, node.hash_value, prefix_keys
+            node.host_value, node.key, node.hash_value, prefix_keys, node.request_id, node.trace_context
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
@@ -646,10 +649,13 @@ class HiRadixCache(RadixCache):
             min_completed_tokens = completed_tokens_tensor.item()
         fetched_token_ids = token_ids[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
+
+        trace_context = trace_get_proc_propagate_context(req_id)
+
         matched_length = self._insert_helper_host(
             last_host_node,
             RadixKey(
-                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
+                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key, request_id=req_id, trace_context=trace_context
             ),
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
@@ -735,8 +741,12 @@ class HiRadixCache(RadixCache):
             last_host_node.release_host()
             # no sufficient host memory for prefetch
             return
+        trace_context = None
+        if self.cache_controller.enable_trace:  
+            from sglang.srt.tracing.trace import trace_get_proc_propagate_context  
+            trace_context = trace_get_proc_propagate_context(req_id)  
         operation = self.cache_controller.prefetch(
-            req_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            req_id, host_indices, new_input_tokens, last_hash, prefix_keys, trace_context
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
@@ -779,6 +789,8 @@ class HiRadixCache(RadixCache):
             new_node.value = None
             new_node.host_value = host_value
             new_node.hash_value = hash_value
+            new_node.request_id = key.request_id
+            new_node.trace_context = key.trace_context
             node.children[child_key] = new_node
         return matched_length
 
@@ -816,6 +828,8 @@ class HiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        new_node.request_id = key.request_id
+        new_node.trace_context = key.trace_context
 
         # split value and host value if exists
         if child.evicted:
@@ -885,6 +899,8 @@ class HiRadixCache(RadixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value
+            new_node.request_id = key.request_id
+            new_node.trace_context = key.trace_context
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
 

@@ -421,7 +421,8 @@ def trace_req_start(
     if str(bootstrap_room) not in remote_trace_contexts:
         attrs = {"bootstrap_room": str(hex(bootstrap_room))}
         bootstrap_room_span = tracer.start_span(
-            name=f"Bootstrap Room {hex(bootstrap_room)}",
+            # name=f"Bootstrap Room {hex(bootstrap_room)}",
+            name=f"{rid}",
             start_time=ts,
             attributes=attrs,
         )

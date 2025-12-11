@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 
+from sglang.srt.tracing.trace import trace_get_proc_propagate_context
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 # Copyright 2023-2024 SGLang Team
@@ -722,7 +723,7 @@ class Req:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
-
+        trace_context = trace_get_proc_propagate_context(self.rid)
         if tree_cache is not None:
             (
                 self.prefix_indices,
@@ -730,7 +731,7 @@ class Req:
                 self.last_host_node,
                 self.host_hit_length,
             ) = tree_cache.match_prefix(
-                key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
+                key=RadixKey(token_ids=token_ids, extra_key=self.extra_key,request_id=self.rid, trace_context=trace_context),
                 **(
                     {"req": self, "cow_mamba": True}
                     if isinstance(tree_cache, MambaRadixCache)

@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional
 
 import torch
 
@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
+from sglang.srt.tracing.trace import trace_req_finish, trace_req_start, trace_set_proc_propagate_context, trace_set_thread_info, trace_slice_start, trace_slice_end
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -194,6 +195,8 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        request_id: str = None,
+        trace_context: Optional[Dict[str, Any]] = None, 
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -201,7 +204,8 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
-
+        self.request_id = request_id
+        self.trace_context = trace_context
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
 
@@ -217,14 +221,14 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        trace_context: Optional[Dict[str, Any]] = None, 
     ):
-        self.request_id = request_id
 
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
 
-        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
+        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys,request_id = request_id, trace_context=trace_context)
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -256,6 +260,7 @@ class HiCacheController:
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
+        enable_trace: bool = False,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -264,7 +269,7 @@ class HiCacheController:
         self.page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
-
+        self.enable_trace = enable_trace
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
             from sglang.srt.mem_cache.hicache_storage import get_hash_str
@@ -559,12 +564,13 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        trace_context: Optional[Dict[str, Any]] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            request_id, host_indices, new_input_tokens, last_hash, prefix_keys, trace_context
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -651,10 +657,16 @@ class HiCacheController:
         """
         Auxiliary function conducting IO operations for prefetching.
         """
+        if self.enable_trace:  
+            trace_set_thread_info("Prefetch Thread", self.tp_rank, self.dp_rank)  
         while not self.stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
+                if operation.request_id and operation.trace_context and self.enable_trace:  
+                    trace_set_proc_propagate_context(operation.request_id, operation.trace_context)  
+                    trace_slice_start("", operation.request_id, anonymous = True)  
                 self._page_transfer(operation)
+                trace_slice_end("prefetch", operation.request_id, thread_finish_flag = True)
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
                     operation.host_indices[operation.completed_tokens :]
@@ -708,6 +720,8 @@ class HiCacheController:
         """
         Manage prefetching operations from storage backend to host memory.
         """
+        if self.enable_trace:  
+            trace_set_thread_info("Lookup Thread", self.tp_rank, self.dp_rank)  
         self.prefetch_buffer = Queue()
         aux_thread = threading.Thread(target=self.prefetch_io_aux_func, daemon=True)
         aux_thread.start()
@@ -716,6 +730,10 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                if operation.request_id and operation.trace_context and self.enable_trace:  
+                    trace_set_proc_propagate_context(operation.request_id, operation.trace_context)  
+
+                    trace_slice_start("", operation.request_id, anonymous = True)  
 
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
                 if self.tp_world_size > 1:
@@ -749,7 +767,7 @@ class HiCacheController:
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
                     self.prefetch_buffer.put(operation)
-
+                trace_slice_end("lookup", operation.request_id, thread_finish_flag = True)
             except Empty:
                 continue
 
@@ -759,14 +777,17 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        request_id: str = None,
+        trace_context: Optional[Dict[str, Any]] = None, 
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
         operation = StorageOperation(
-            host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+            host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys, request_id=request_id, trace_context=trace_context
         )
         self.backup_queue.put(operation)
+
         return operation.id
 
     # todo: deprecate
@@ -809,15 +830,18 @@ class HiCacheController:
         """
         Manage backup operations from host memory to storage backend.
         """
+        if self.enable_trace:
+            trace_set_thread_info("BackUp", self.tp_rank, self.dp_rank)
         while not self.stop_event.is_set():
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-
+                trace_set_proc_propagate_context(operation.request_id, operation.trace_context)
+                trace_slice_start(f"Backup: Operation TP {self.tp_rank}", operation.request_id)
                 if not self.backup_skip:
                     self._page_backup(operation)
+                trace_slice_end(f"Backup: Operation TP {self.tp_rank}", operation.request_id)
                 self.ack_backup_queue.put(operation)
-
             except Empty:
                 continue
