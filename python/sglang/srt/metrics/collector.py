@@ -56,8 +56,8 @@ class TimeStats:
     t_prefetch_io_start: float = 0.0
     t_prefetch_io_done: float = 0.0
     t_prefetch_done: float = 0.0
+    t_prefill_before: float = 0.0
     t_prefill_start: float = 0.0
-    t_prefill_end: float = 0.0
     t_decode_start: float = 0.0
     t_decode_end: float = 0.0
     t_end: float = 0.0
@@ -170,8 +170,8 @@ class TimeStats:
     def _format_extra_stats(self) -> str:
         prefetch_total = self._maybe_duration(self.t_prefetch_start, self.t_prefetch_done)
         prefetch_io = self._maybe_duration(self.t_prefetch_io_start, self.t_prefetch_io_done)
-        prefill_before = self._maybe_duration(self.t_recv, self.t_prefill_start)
-        prefill_compute = self._maybe_duration(self.t_prefill_end, self.prefill_end_time)
+        prefill_before = self._maybe_duration(self.t_recv, self.t_prefill_before)
+        prefill_compute = self._maybe_duration(self.t_prefill_start, self.prefill_end_time)
         decode_total = self._maybe_duration(self.t_decode_start, self.t_decode_end)
         total_end = self.t_end if self.t_end > 0.0 else self.completion_time
         total = self._maybe_duration(self.t_recv, total_end)

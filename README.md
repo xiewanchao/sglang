@@ -89,8 +89,8 @@ We learned the design and reused code from the following projects: [Guidance](ht
 prefetch_total	prefetch 总耗时	t_prefetch_done - t_prefetch_start	仅当发起 prefetch 且完成/撤销时有值
 prefetch_io	prefetch 实际 IO 耗时	t_prefetch_io_done - t_prefetch_io_start	线程内 IO 开始/结束打点；未进入 IO 则 N/A
 prefetch_wait	调度等待耗时（剔除 IO）	优先用 prefetch_wait_duration；否则 t_prefetch_done - t_prefetch_issue - prefetch_io	check_prefetch_progress 被阻塞/跳过时累积
-prefill_before	prefill 前总耗时	t_prefill_start - t_recv	从收到请求到进入 add_one_req 前
-prefill	prefill 计算耗时	prefill_end_time - t_prefill_end	t_prefill_end 在 prefill forward 之前；prefill_end_time 在 prefill forward 结束
+prefill_before	prefill 前总耗时	t_prefill_before - t_recv	从收到请求到进入 add_one_req 前
+prefill	prefill 计算耗时	prefill_end_time - t_prefill_start	t_prefill_start 在 prefill forward 之前；prefill_end_time 在 prefill forward 结束
 decode	decode 总耗时	t_decode_end - t_decode_start	decode batch 第一次进入到请求完成
 total	请求总耗时	t_end - t_recv（若 t_end 未写入则用 completion_time）	t_end 在最终输出阶段写入
 queue_duration	排队等待耗时（调度队列等待）	forward_entry_time - wait_queue_entry_time	统一模式/解耦模式都可用
@@ -103,8 +103,8 @@ t_prefetch_start：调用 prefetch_from_storage 前。
 t_prefetch_issue：prefetch operation 入队完成。
 t_prefetch_io_start/t_prefetch_io_done：prefetch IO 线程开始/结束。
 t_prefetch_done：check_prefetch_progress 判定完成/撤销。
-t_prefill_start：adder.add_one_req 前。
-t_prefill_end：prefill forward 开始前。
+t_prefill_before：adder.add_one_req 前。
+t_prefill_start：prefill forward 开始前。
 prefill_end_time：prefill forward 结束。
 t_decode_start：decode batch 开始。
 t_decode_end：请求完成时（completion_time）。

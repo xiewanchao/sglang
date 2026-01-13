@@ -1821,8 +1821,8 @@ class Scheduler(
                     req.time_stats.t_prefetch_done = time.perf_counter()
 
             req.init_next_round_input(self.tree_cache)
-            if req.time_stats.t_prefill_start == 0.0:
-                req.time_stats.t_prefill_start = time.perf_counter()
+            if req.time_stats.t_prefill_before == 0.0:
+                req.time_stats.t_prefill_before = time.perf_counter()
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -1985,8 +1985,8 @@ class Scheduler(
             current_time = time.perf_counter()
             for req in batch.reqs:
                 req.time_stats.prefill_start_time = current_time
-                if req.time_stats.t_prefill_end == 0.0:
-                    req.time_stats.t_prefill_end = current_time
+                if req.time_stats.t_prefill_start == 0.0:
+                    req.time_stats.t_prefill_start = current_time
         elif batch.forward_mode.is_decode():
             current_time = time.perf_counter()
             for req in batch.reqs:
