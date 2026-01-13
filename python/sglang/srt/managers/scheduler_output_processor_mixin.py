@@ -113,6 +113,11 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
                         req.time_stats.completion_time = time.perf_counter()
+                        if (
+                            req.time_stats.t_decode_start > 0.0
+                            and req.time_stats.t_decode_end == 0.0
+                        ):
+                            req.time_stats.t_decode_end = req.time_stats.completion_time
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -380,6 +385,11 @@ class SchedulerOutputProcessorMixin:
                     self.tree_cache.cache_finished_req(req)
 
                 req.time_stats.completion_time = time.perf_counter()
+                if (
+                    req.time_stats.t_decode_start > 0.0
+                    and req.time_stats.t_decode_end == 0.0
+                ):
+                    req.time_stats.t_decode_end = req.time_stats.completion_time
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
@@ -806,6 +816,8 @@ class SchedulerOutputProcessorMixin:
                 req.finished_output = True
                 if req.finished_len is None:
                     req.finished_len = len(req.output_ids)
+                if req.time_stats.t_end == 0.0:
+                    req.time_stats.t_end = time.perf_counter()
                 should_output = True
             else:
                 if req.stream:
@@ -1033,6 +1045,8 @@ class SchedulerOutputProcessorMixin:
         retraction_counts = []
         for req in reqs:
             if req.finished():
+                if req.time_stats.t_end == 0.0:
+                    req.time_stats.t_end = time.perf_counter()
                 rids.append(req.rid)
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())

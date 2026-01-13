@@ -223,6 +223,8 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        self.t_io_start = 0.0
+        self.t_io_done = 0.0
 
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
 
@@ -654,7 +656,11 @@ class HiCacheController:
         while not self.stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
+                if operation.t_io_start == 0.0:
+                    operation.t_io_start = time.perf_counter()
                 self._page_transfer(operation)
+                if operation.t_io_done == 0.0:
+                    operation.t_io_done = time.perf_counter()
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
                     operation.host_indices[operation.completed_tokens :]

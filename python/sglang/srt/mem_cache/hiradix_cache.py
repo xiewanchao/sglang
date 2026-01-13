@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.metrics.collector import StorageMetricsCollector
+from sglang.srt.metrics.collector import StorageMetricsCollector, TimeStats
 
 logger = logging.getLogger(__name__)
 
@@ -538,9 +538,16 @@ class HiRadixCache(RadixCache):
             req_id = cc.prefetch_revoke_queue.get()
             info = self.ongoing_prefetch.pop(req_id, None)
             if info is not None:
-                last_host_node, token_ids, _, _ = info
+                last_host_node, token_ids, _, operation, time_stats = info
                 last_host_node.release_host()
                 cc.prefetch_tokens_occupied -= len(token_ids)
+                if time_stats is not None:
+                    if operation.t_io_start > 0.0 and time_stats.t_prefetch_io_start == 0.0:
+                        time_stats.t_prefetch_io_start = operation.t_io_start
+                    if operation.t_io_done > 0.0 and time_stats.t_prefetch_io_done == 0.0:
+                        time_stats.t_prefetch_io_done = operation.t_io_done
+                    if time_stats.t_prefetch_done == 0.0:
+                        time_stats.t_prefetch_done = time.perf_counter()
             # else: the revoked operation already got terminated, nothing to do
 
         # process backup acks
@@ -616,9 +623,13 @@ class HiRadixCache(RadixCache):
 
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
-            req_id
-        ]
+        (
+            last_host_node,
+            token_ids,
+            host_indices,
+            operation,
+            time_stats,
+        ) = self.ongoing_prefetch[req_id]
 
         if operation.host_indices is None:
             # prefetch has not been issued due to insufficient host memory
@@ -631,6 +642,13 @@ class HiRadixCache(RadixCache):
             operation
         )
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+        if time_stats is not None:
+            if operation.t_io_start > 0.0 and time_stats.t_prefetch_io_start == 0.0:
+                time_stats.t_prefetch_io_start = operation.t_io_start
+            if operation.t_io_done > 0.0 and time_stats.t_prefetch_io_done == 0.0:
+                time_stats.t_prefetch_io_done = operation.t_io_done
+            if time_stats.t_prefetch_done == 0.0:
+                time_stats.t_prefetch_done = time.perf_counter()
 
         min_completed_tokens = completed_tokens
         if self.tp_world_size > 1:
@@ -713,6 +731,7 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        time_stats: Optional[TimeStats] = None,
     ):
         # align the number of fetching tokens to the page size
         prefetch_length = len(new_input_tokens) - (
@@ -724,7 +743,7 @@ class HiRadixCache(RadixCache):
             or prefetch_length < self.prefetch_threshold
             or self.cache_controller.prefetch_rate_limited()
         ):
-            return
+            return None
 
         last_host_node.protect_host()
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
@@ -734,17 +753,21 @@ class HiRadixCache(RadixCache):
         if host_indices is None:
             last_host_node.release_host()
             # no sufficient host memory for prefetch
-            return
+            return None
         operation = self.cache_controller.prefetch(
             req_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
+        if time_stats is not None and time_stats.t_prefetch_issue == 0.0:
+            time_stats.t_prefetch_issue = time.perf_counter()
         self.ongoing_prefetch[req_id] = (
             last_host_node,
             new_input_tokens,
             host_indices,
             operation,
+            time_stats,
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+        return operation
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
@@ -936,7 +959,13 @@ class HiRadixCache(RadixCache):
         if rid not in self.ongoing_prefetch:
             return
 
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
+        (
+            last_host_node,
+            token_ids,
+            host_indices,
+            operation,
+            time_stats,
+        ) = self.ongoing_prefetch[rid]
         if operation.host_indices is None:
             return
 
@@ -945,5 +974,12 @@ class HiRadixCache(RadixCache):
             torch.distributed.barrier(group=self.tp_group)
         last_host_node.release_host()
         del self.ongoing_prefetch[rid]
+        if time_stats is not None:
+            if operation.t_io_start > 0.0 and time_stats.t_prefetch_io_start == 0.0:
+                time_stats.t_prefetch_io_start = operation.t_io_start
+            if operation.t_io_done > 0.0 and time_stats.t_prefetch_io_done == 0.0:
+                time_stats.t_prefetch_io_done = operation.t_io_done
+            if time_stats.t_prefetch_done == 0.0:
+                time_stats.t_prefetch_done = time.perf_counter()
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)

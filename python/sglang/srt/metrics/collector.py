@@ -48,6 +48,21 @@ class TimeStats:
     alloc_waiting_duration: float = 0.0
     prefill_start_time: float = 0.0
     prefill_end_time: float = 0.0
+    # Request-level detailed timing stats (prefill before/after + prefetch)
+    t_recv: float = 0.0
+    t_enqueue: float = 0.0
+    t_prefetch_start: float = 0.0
+    t_prefetch_issue: float = 0.0
+    t_prefetch_io_start: float = 0.0
+    t_prefetch_io_done: float = 0.0
+    t_prefetch_done: float = 0.0
+    t_prefill_start: float = 0.0
+    t_prefill_end: float = 0.0
+    t_decode_start: float = 0.0
+    t_decode_end: float = 0.0
+    t_end: float = 0.0
+    prefetch_wait_start_time: float = 0.0
+    prefetch_wait_duration: float = 0.0
 
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
@@ -62,7 +77,12 @@ class TimeStats:
                     queue_duration >= 0 and forward_duration >= 0
                 ), f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
 
-            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.wait_queue_entry_time:.3f}"
+            base = (
+                f"queue_duration={self.format_duration(queue_duration)}, "
+                f"forward_duration={self.format_duration(forward_duration)}, "
+                f"start_time={self.wait_queue_entry_time:.3f}"
+            )
+            return f"{base}, {self._format_extra_stats()}"
         elif self.disagg_mode == DisaggregationMode.PREFILL:
             bootstrap_duration = (
                 self.wait_queue_entry_time - self.prefill_bootstrap_queue_entry_time
@@ -83,7 +103,7 @@ class TimeStats:
                 bootstrap_duration
                 - (self.alloc_waiting_duration + self.bootstrap_duration),
             )
-            return (
+            base = (
                 f"bootstrap_queue_duration({self.format_duration(bootstrap_duration)}) "
                 f"= alloc_wait({self.format_duration(self.alloc_waiting_duration)}) "
                 f"+ bootstrap({self.format_duration(self.bootstrap_duration)}) "
@@ -92,6 +112,7 @@ class TimeStats:
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"start={self.prefill_bootstrap_queue_entry_time:.3f}"
             )
+            return f"{base}, {self._format_extra_stats()}"
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = (
                 self.decode_transfer_queue_entry_time
@@ -117,7 +138,7 @@ class TimeStats:
                 prealloc_duration
                 - (self.alloc_waiting_duration + self.bootstrap_duration),
             )
-            return (
+            base = (
                 f"prealloc_queue_duration({self.format_duration(prealloc_duration)}) "
                 f"= alloc_wait({self.format_duration(self.alloc_waiting_duration)}) "
                 f"+ bootstrap({self.format_duration(self.bootstrap_duration)}) "
@@ -127,11 +148,62 @@ class TimeStats:
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"start={self.decode_prealloc_queue_entry_time:.3f}"
             )
+            return f"{base}, {self._format_extra_stats()}"
         else:
-            return "Unknown Time Stats"
+            return f"Unknown Time Stats, {self._format_extra_stats()}"
 
     def format_duration(self, duration: float) -> str:
         return f"{duration * 1e3:.2f}ms"
+
+    def _maybe_duration(self, start: float, end: float) -> Optional[float]:
+        if start > 0.0 and end > 0.0:
+            duration = end - start
+            if duration >= 0.0:
+                return duration
+        return None
+
+    def _format_optional_duration(self, duration: Optional[float]) -> str:
+        if duration is None:
+            return "N/A"
+        return self.format_duration(duration)
+
+    def _format_extra_stats(self) -> str:
+        prefetch_total = self._maybe_duration(self.t_prefetch_start, self.t_prefetch_done)
+        prefetch_io = self._maybe_duration(self.t_prefetch_io_start, self.t_prefetch_io_done)
+        prefill_before = self._maybe_duration(self.t_recv, self.t_prefill_start)
+        prefill_compute = self._maybe_duration(self.t_prefill_end, self.prefill_end_time)
+        decode_total = self._maybe_duration(self.t_decode_start, self.t_decode_end)
+        total_end = self.t_end if self.t_end > 0.0 else self.completion_time
+        total = self._maybe_duration(self.t_recv, total_end)
+
+        prefetch_wait = None
+        if self.prefetch_wait_duration > 0.0:
+            prefetch_wait = self.prefetch_wait_duration
+        elif (
+            prefetch_total is not None
+            and prefetch_io is not None
+            and self.t_prefetch_issue > 0.0
+        ):
+            prefetch_wait = max(
+                0.0, (self.t_prefetch_done - self.t_prefetch_issue) - prefetch_io
+            )
+
+        return (
+            "prefetch_total="
+            + self._format_optional_duration(prefetch_total)
+            + ", prefetch_io="
+            + self._format_optional_duration(prefetch_io)
+            + ", prefetch_wait="
+            + self._format_optional_duration(prefetch_wait)
+            + ", prefill_before="
+            + self._format_optional_duration(prefill_before)
+            + ", prefill="
+            + self._format_optional_duration(prefill_compute)
+            + ", decode="
+            + self._format_optional_duration(decode_total)
+            + ", total="
+            + self._format_optional_duration(total)
+        )
 
     def disagg_mode_str(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:

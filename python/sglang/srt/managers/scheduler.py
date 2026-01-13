@@ -1254,6 +1254,8 @@ class Scheduler(
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
+            if req.time_stats.t_recv == 0.0:
+                req.time_stats.t_recv = time.perf_counter()
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -1281,6 +1283,8 @@ class Scheduler(
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
+            if req.time_stats.t_recv == 0.0:
+                req.time_stats.t_recv = time.perf_counter()
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
@@ -1407,15 +1411,22 @@ class Scheduler(
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                self.tree_cache.prefetch_from_storage(
+                if req.time_stats.t_prefetch_start == 0.0:
+                    req.time_stats.t_prefetch_start = time.perf_counter()
+                operation = self.tree_cache.prefetch_from_storage(
                     req.rid,
                     req.last_host_node,
                     new_input_tokens,
                     last_hash,
                     prefix_keys,
+                    time_stats=req.time_stats,
                 )
+                if operation is None and req.time_stats.t_prefetch_issue == 0.0:
+                    req.time_stats.t_prefetch_start = 0.0
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if req.time_stats.t_enqueue == 0.0:
+            req.time_stats.t_enqueue = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return
@@ -1520,6 +1531,8 @@ class Scheduler(
             http_worker_ipc=recv_req.http_worker_ipc,
         )
         req.tokenizer = self.tokenizer
+        if req.time_stats.t_recv == 0.0:
+            req.time_stats.t_recv = time.perf_counter()
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
@@ -1793,9 +1806,23 @@ class Scheduler(
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    if req.time_stats.prefetch_wait_start_time == 0.0:
+                        req.time_stats.prefetch_wait_start_time = time.perf_counter()
                     continue
+                if req.time_stats.prefetch_wait_start_time > 0.0:
+                    req.time_stats.prefetch_wait_duration += (
+                        time.perf_counter() - req.time_stats.prefetch_wait_start_time
+                    )
+                    req.time_stats.prefetch_wait_start_time = 0.0
+                if (
+                    req.time_stats.t_prefetch_start > 0.0
+                    and req.time_stats.t_prefetch_done == 0.0
+                ):
+                    req.time_stats.t_prefetch_done = time.perf_counter()
 
             req.init_next_round_input(self.tree_cache)
+            if req.time_stats.t_prefill_start == 0.0:
+                req.time_stats.t_prefill_start = time.perf_counter()
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -1958,6 +1985,13 @@ class Scheduler(
             current_time = time.perf_counter()
             for req in batch.reqs:
                 req.time_stats.prefill_start_time = current_time
+                if req.time_stats.t_prefill_end == 0.0:
+                    req.time_stats.t_prefill_end = current_time
+        elif batch.forward_mode.is_decode():
+            current_time = time.perf_counter()
+            for req in batch.reqs:
+                if req.time_stats.t_decode_start == 0.0:
+                    req.time_stats.t_decode_start = current_time
 
         # Run forward
         if self.is_generation:
