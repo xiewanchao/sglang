@@ -951,8 +951,15 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
-    def _should_log_sched_step(self, loop_id: int, elapsed_ms: float) -> bool:
+    def _should_log_sched_step(
+        self,
+        loop_id: int,
+        elapsed_ms: float,
+        batch: Optional[ScheduleBatch],
+    ) -> bool:
         if not envs.SGLANG_SCHED_LOG.get():
+            return False
+        if batch is None:
             return False
         every_n = max(envs.SGLANG_LOG_EVERY_N.get(), 1)
         if loop_id % every_n != 0:
@@ -960,23 +967,18 @@ class Scheduler(
         min_ms = envs.SGLANG_LOG_MIN_MS.get()
         return elapsed_ms >= min_ms
 
-    def _log_sched_step(
+    def _log_sched_step_elapsed(
         self,
         step: str,
-        start_time: float,
+        elapsed_ms: float,
         loop_id: int,
-        batch: Optional[ScheduleBatch] = None,
+        batch: Optional[ScheduleBatch],
         extra: Optional[Dict[str, Union[int, float, str]]] = None,
     ) -> None:
-        elapsed_ms = (time.perf_counter() - start_time) * 1e3
-        if not self._should_log_sched_step(loop_id, elapsed_ms):
+        if not self._should_log_sched_step(loop_id, elapsed_ms, batch):
             return
-        if batch is None:
-            batch_size = 0
-            forward_mode = "idle"
-        else:
-            batch_size = batch.batch_size()
-            forward_mode = batch.forward_mode.name
+        batch_size = batch.batch_size()
+        forward_mode = batch.forward_mode.name
         parts = [
             "[SCHED]",
             f"step={step}",
@@ -992,6 +994,17 @@ class Scheduler(
             for k, v in extra.items():
                 parts.append(f"{k}={v}")
         logger.info(" ".join(parts))
+
+    def _log_sched_step(
+        self,
+        step: str,
+        start_time: float,
+        loop_id: int,
+        batch: Optional[ScheduleBatch],
+        extra: Optional[Dict[str, Union[int, float, str]]] = None,
+    ) -> None:
+        elapsed_ms = (time.perf_counter() - start_time) * 1e3
+        self._log_sched_step_elapsed(step, elapsed_ms, loop_id, batch, extra)
 
     def init_moe_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
@@ -1027,16 +1040,33 @@ class Scheduler(
 
             t0 = time.perf_counter()
             recv_reqs = self.recv_requests()
-            self._log_sched_step("recv_requests", t0, loop_id)
+            recv_ms = (time.perf_counter() - t0) * 1e3
 
             t0 = time.perf_counter()
             self.process_input_requests(recv_reqs)
-            self._log_sched_step("process_input_requests", t0, loop_id)
+            process_ms = (time.perf_counter() - t0) * 1e3
 
             t0 = time.perf_counter()
+            if self.enable_hierarchical_cache and hasattr(self.tree_cache, "begin_log_buffer"):
+                self.tree_cache.set_log_active(False)
+                self.tree_cache.begin_log_buffer()
             batch = self.get_next_batch_to_run()
-            self._log_sched_step("get_next_batch_to_run", t0, loop_id, batch=batch)
+            get_batch_ms = (time.perf_counter() - t0) * 1e3
+            if self.enable_hierarchical_cache and hasattr(self.tree_cache, "flush_log_buffer"):
+                self.tree_cache.flush_log_buffer(batch is not None)
+                self.tree_cache.set_log_active(batch is not None)
             self.cur_batch = batch
+
+            if batch is not None:
+                self._log_sched_step_elapsed(
+                    "recv_requests", recv_ms, loop_id, batch
+                )
+                self._log_sched_step_elapsed(
+                    "process_input_requests", process_ms, loop_id, batch
+                )
+                self._log_sched_step_elapsed(
+                    "get_next_batch_to_run", get_batch_ms, loop_id, batch
+                )
 
             batch_result = None
             if batch:
@@ -1057,7 +1087,7 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 t0 = time.perf_counter()
                 self.self_check_during_idle()
-                self._log_sched_step("self_check_during_idle", t0, loop_id)
+                self._log_sched_step("self_check_during_idle", t0, loop_id, batch=None)
 
             t0 = time.perf_counter()
             self.launch_batch_sample_if_needed(batch_result)
@@ -1069,7 +1099,7 @@ class Scheduler(
             if envs.SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK.get():
                 t0 = time.perf_counter()
                 self._check_runtime_mem_leak()
-                self._log_sched_step("runtime_mem_leak_check", t0, loop_id)
+                self._log_sched_step("runtime_mem_leak_check", t0, loop_id, batch=batch)
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""

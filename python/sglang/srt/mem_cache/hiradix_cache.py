@@ -128,6 +128,9 @@ class HiRadixCache(RadixCache):
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
         self._hicache_log_counter = 0
+        self._hicache_log_active = False
+        self._hicache_log_buffer_active = False
+        self._hicache_log_buffer = []
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 2
@@ -801,12 +804,28 @@ class HiRadixCache(RadixCache):
         )
         return True
 
+    def begin_log_buffer(self) -> None:
+        self._hicache_log_buffer_active = True
+        self._hicache_log_buffer = []
+
+    def flush_log_buffer(self, emit: bool) -> None:
+        if emit:
+            for msg in self._hicache_log_buffer:
+                logger.info(msg)
+        self._hicache_log_buffer = []
+        self._hicache_log_buffer_active = False
+
+    def set_log_active(self, active: bool) -> None:
+        self._hicache_log_active = active
+
     def _hicache_next_log_id(self) -> int:
         self._hicache_log_counter += 1
         return self._hicache_log_counter
 
     def _should_log_hicache_step(self, log_id: int, elapsed_ms: float) -> bool:
         if not envs.SGLANG_HICACHE_LOG.get():
+            return False
+        if not self._hicache_log_buffer_active and not self._hicache_log_active:
             return False
         every_n = max(envs.SGLANG_LOG_EVERY_N.get(), 1)
         if log_id % every_n != 0:
@@ -834,7 +853,11 @@ class HiRadixCache(RadixCache):
         if extra:
             for k, v in extra.items():
                 parts.append(f"{k}={v}")
-        logger.info(" ".join(parts))
+        msg = " ".join(parts)
+        if self._hicache_log_buffer_active:
+            self._hicache_log_buffer.append(msg)
+            return
+        logger.info(msg)
 
     def match_prefix(self, key: RadixKey, **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
