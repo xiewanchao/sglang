@@ -130,6 +130,10 @@ class Envs:
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
+    SGLANG_SCHED_LOG = EnvBool(False)
+    SGLANG_HICACHE_LOG = EnvBool(False)
+    SGLANG_LOG_EVERY_N = EnvInt(1)
+    SGLANG_LOG_MIN_MS = EnvFloat(0.0)
 
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)

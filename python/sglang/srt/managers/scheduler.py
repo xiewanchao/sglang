@@ -428,6 +428,7 @@ class Scheduler(
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.forward_ct_decode = 0
+        self._sched_loop_ct = 0
         self.num_generated_tokens = 0
         self.last_prefill_tokens = 0
         self.return_health_check_ct = 0
@@ -950,6 +951,48 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
+    def _should_log_sched_step(self, loop_id: int, elapsed_ms: float) -> bool:
+        if not envs.SGLANG_SCHED_LOG.get():
+            return False
+        every_n = max(envs.SGLANG_LOG_EVERY_N.get(), 1)
+        if loop_id % every_n != 0:
+            return False
+        min_ms = envs.SGLANG_LOG_MIN_MS.get()
+        return elapsed_ms >= min_ms
+
+    def _log_sched_step(
+        self,
+        step: str,
+        start_time: float,
+        loop_id: int,
+        batch: Optional[ScheduleBatch] = None,
+        extra: Optional[Dict[str, Union[int, float, str]]] = None,
+    ) -> None:
+        elapsed_ms = (time.perf_counter() - start_time) * 1e3
+        if not self._should_log_sched_step(loop_id, elapsed_ms):
+            return
+        if batch is None:
+            batch_size = 0
+            forward_mode = "idle"
+        else:
+            batch_size = batch.batch_size()
+            forward_mode = batch.forward_mode.name
+        parts = [
+            "[SCHED]",
+            f"step={step}",
+            f"loop={loop_id}",
+            f"mode={forward_mode}",
+            f"bs={batch_size}",
+            f"tp={self.tp_rank}",
+            f"pp={self.pp_rank}",
+            f"dp={self.dp_rank if self.dp_rank is not None else 0}",
+            f"elapsed_ms={elapsed_ms:.2f}",
+        ]
+        if extra:
+            for k, v in extra.items():
+                parts.append(f"{k}={v}")
+        logger.info(" ".join(parts))
+
     def init_moe_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
@@ -979,30 +1022,54 @@ class Scheduler(
         self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
 
         while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
+            self._sched_loop_ct += 1
+            loop_id = self._sched_loop_ct
 
+            t0 = time.perf_counter()
+            recv_reqs = self.recv_requests()
+            self._log_sched_step("recv_requests", t0, loop_id)
+
+            t0 = time.perf_counter()
+            self.process_input_requests(recv_reqs)
+            self._log_sched_step("process_input_requests", t0, loop_id)
+
+            t0 = time.perf_counter()
             batch = self.get_next_batch_to_run()
+            self._log_sched_step("get_next_batch_to_run", t0, loop_id, batch=batch)
             self.cur_batch = batch
 
             batch_result = None
             if batch:
+                t0 = time.perf_counter()
                 batch_result = self.run_batch(batch)
+                self._log_sched_step("run_batch", t0, loop_id, batch=batch)
                 self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
+                t0 = time.perf_counter()
                 self.process_batch_result(tmp_batch, tmp_result)
+                self._log_sched_step(
+                    "process_batch_result", t0, loop_id, batch=tmp_batch
+                )
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
+                t0 = time.perf_counter()
                 self.self_check_during_idle()
+                self._log_sched_step("self_check_during_idle", t0, loop_id)
 
+            t0 = time.perf_counter()
             self.launch_batch_sample_if_needed(batch_result)
+            self._log_sched_step(
+                "launch_batch_sample_if_needed", t0, loop_id, batch=batch
+            )
             self.last_batch = batch
 
             if envs.SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK.get():
+                t0 = time.perf_counter()
                 self._check_runtime_mem_leak()
+                self._log_sched_step("runtime_mem_leak_check", t0, loop_id)
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
