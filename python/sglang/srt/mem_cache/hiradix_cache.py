@@ -284,7 +284,7 @@ class HiRadixCache(RadixCache):
                     if start_event is not None:
                         try:
                             elapsed_ms = start_event.elapsed_time(finish_event)
-                            logger.debug(
+                            logger.info(
                                 "hicache backup (write_back) done: %.3f ms, nodes=%d",
                                 elapsed_ms,
                                 len(ack_list),
@@ -324,7 +324,7 @@ class HiRadixCache(RadixCache):
             if start_event is not None:
                 try:
                     elapsed_ms = start_event.elapsed_time(finish_event)
-                    logger.debug(
+                    logger.info(
                         "hicache backup done: %.3f ms, nodes=%d",
                         elapsed_ms,
                         len(ack_list),
