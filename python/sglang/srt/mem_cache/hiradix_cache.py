@@ -278,8 +278,20 @@ class HiRadixCache(RadixCache):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+                for start_event, finish_event, ack_list in self.cache_controller.ack_write_queue:
                     finish_event.synchronize()
+                    # Log each backup op latency in ms (if start_event is valid).
+                    if start_event is not None:
+                        try:
+                            elapsed_ms = start_event.elapsed_time(finish_event)
+                            logger.debug(
+                                "hicache backup (write_back) done: %.3f ms, nodes=%d",
+                                elapsed_ms,
+                                len(ack_list),
+                            )
+                        except Exception:
+                            # elapsed_time can fail if events are invalid; avoid breaking critical path.
+                            pass
                     for ack_id in ack_list:
                         del self.ongoing_write_through[ack_id]
                 self.cache_controller.ack_write_queue.clear()
@@ -291,7 +303,7 @@ class HiRadixCache(RadixCache):
             return
 
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+        for start_event, finish_event, ack_list in self.cache_controller.ack_write_queue:
             if not finish_event.query():
                 break
             finish_count += 1
@@ -306,8 +318,20 @@ class HiRadixCache(RadixCache):
 
         finish_count = int(queue_size.item())
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+            start_event, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
+            # Log each backup op latency in ms (if start_event is valid).
+            if start_event is not None:
+                try:
+                    elapsed_ms = start_event.elapsed_time(finish_event)
+                    logger.debug(
+                        "hicache backup done: %.3f ms, nodes=%d",
+                        elapsed_ms,
+                        len(ack_list),
+                    )
+                except Exception:
+                    # elapsed_time can fail if events are invalid; avoid breaking critical path.
+                    pass
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(backuped_node)
