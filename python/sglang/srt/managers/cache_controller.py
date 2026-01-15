@@ -448,8 +448,8 @@ class HiCacheController:
         host_indices, device_indices = self.move_indices(op)
         self.write_queue.clear()
 
-        start_event = torch.cuda.Event()
-        finish_event = torch.cuda.Event()
+        start_event = torch.cuda.Event(enable_timing=True)
+        finish_event = torch.cuda.Event(enable_timing=True)
 
         start_event.record()
         with torch.cuda.stream(self.write_stream):
